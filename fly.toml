@@ -1,0 +1,31 @@
+# fly.toml app configuration file generated for damp-fire-3341 on 2025-09-11T15:00:54+02:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = "damp-fire-3341"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[vm]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1024MB"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 2
+  processes = ["app"]
+
+  [[http_service.checks]]
+    type = "http"
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"

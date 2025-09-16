@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+websockets
+loguru
+pipecat-ai[websocket,google,silero,runner]>=0.0.84
+pipecatcloud>=0.2.4
+wsproto>=1.2.0
+
+
