@@ -33,6 +33,9 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 
 load_dotenv(override=True)
 
+# Hinweis: Für lokale Checks auf Merge-Konfliktmarker kann
+# scripts/check_no_merge_conflicts.py ausgeführt werden.
+
 
 DEFAULT_SYSTEM_PROMPT = """
 Du bist der deutschsprachige Voice-Agent unserer Agentur. Du hilfst aktiv bei Terminbuchungen
