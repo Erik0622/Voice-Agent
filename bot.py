@@ -3,8 +3,11 @@ import os
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
+import phonenumbers
+from phonenumbers import NumberParseException, PhoneNumberFormat, region_code_for_number
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -167,20 +170,46 @@ class BookingAPI:
         self.agent_secret = agent_secret
         self.timezone = timezone
         self._timeout = httpx.Timeout(10.0)
-        self.caller_phone = caller_phone.strip() if caller_phone else None
+        self._tzinfo = ZoneInfo(self.timezone)
+
+        default_region_env = os.getenv("BOOKING_DEFAULT_REGION", "").strip().upper()
+        self.default_region = default_region_env or "DE"
+
+        self.caller_phone = self._normalize_phone_number(caller_phone, None)
+        if caller_phone and not self.caller_phone:
+            logger.warning(
+                "Anrufernummer konnte nicht normalisiert werden: {}", caller_phone
+            )
+        caller_region = self._detect_region(self.caller_phone)
+        if caller_region:
+            self.default_region = caller_region
+
         from_number = twilio_from_number.strip() if twilio_from_number else None
         if not from_number:
             fallback_from = os.getenv("TWILIO_SMS_FROM_NUMBER")
             from_number = fallback_from.strip() if fallback_from else None
-        self.twilio_from_number = from_number
+        self.twilio_from_number = self._normalize_phone_number(from_number, None)
+        if from_number and not self.twilio_from_number:
+            logger.warning(
+                "Twilio-Absendernummer konnte nicht normalisiert werden: {}",
+                from_number,
+            )
+
         configured_recipient = (
             notification_recipient
             or os.getenv("BOOKING_NOTIFICATION_SMS_RECIPIENT")
             or DEFAULT_NOTIFICATION_RECIPIENT
         )
-        self.notification_recipient = (
-            configured_recipient.strip() if configured_recipient else None
+        normalized_recipient = self._normalize_phone_number(
+            configured_recipient, self.default_region
         )
+        if configured_recipient and not normalized_recipient:
+            logger.warning(
+                "SMS-Empfänger konnte nicht normalisiert werden: {}",
+                configured_recipient,
+            )
+        self.notification_recipient = normalized_recipient
+
         self.twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         self.twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
 
@@ -189,6 +218,84 @@ class BookingAPI:
         if self.agent_secret:
             headers["x-agent-secret"] = self.agent_secret
         return headers
+
+    def _normalize_phone_number(
+        self, phone: Optional[str], region_hint: Optional[str]
+    ) -> Optional[str]:
+        if not phone:
+            return None
+        candidate = str(phone).strip()
+        if not candidate:
+            return None
+
+        attempts: List[str] = [candidate]
+        digits = "".join(ch for ch in candidate if ch.isdigit() or ch == "+")
+        if digits and digits not in attempts:
+            attempts.append(digits)
+        if digits.startswith("00"):
+            alt = "+" + digits[2:]
+            if alt not in attempts:
+                attempts.append(alt)
+
+        region_order: List[Optional[str]] = []
+        if region_hint:
+            region_order.append(region_hint)
+        if self.default_region and self.default_region not in region_order:
+            region_order.append(self.default_region)
+        region_order.append(None)
+
+        for attempt in attempts:
+            if not attempt:
+                continue
+            for region in region_order:
+                try:
+                    parsed = phonenumbers.parse(attempt, region)
+                except NumberParseException:
+                    continue
+                if not phonenumbers.is_possible_number(parsed):
+                    continue
+                try:
+                    formatted = phonenumbers.format_number(
+                        parsed, PhoneNumberFormat.E164
+                    )
+                except Exception:
+                    continue
+                if formatted:
+                    return formatted
+
+        if digits.startswith("+") and len(digits) >= 8:
+            return digits
+        return None
+
+    @staticmethod
+    def _detect_region(phone: Optional[str]) -> Optional[str]:
+        if not phone:
+            return None
+        try:
+            parsed = phonenumbers.parse(phone, None)
+        except NumberParseException:
+            return None
+        region = region_code_for_number(parsed)
+        if region:
+            return region
+        return None
+
+    def _now(self) -> datetime:
+        return datetime.now(self._tzinfo)
+
+    def _slot_datetime(self, slot_date: date, time_str: str) -> datetime:
+        hour, minute = map(int, time_str.split(":", 1))
+        return datetime(
+            slot_date.year,
+            slot_date.month,
+            slot_date.day,
+            hour,
+            minute,
+            tzinfo=self._tzinfo,
+        )
+
+    def _is_slot_in_past(self, slot_date: date, time_str: str) -> bool:
+        return self._slot_datetime(slot_date, time_str) <= self._now()
 
     async def _request(
         self,
@@ -314,14 +421,28 @@ class BookingAPI:
 
         result: List[Dict[str, Any]] = []
         current = start_date
+        now = self._now()
+        today = now.date()
+
         while current <= end_date:
+            if current < today:
+                current += timedelta(days=1)
+                continue
+
             hours = self._allowed_start_hours(current.weekday())
             if hours:
                 date_key = current.isoformat()
                 busy = occupied.get(date_key, set())
-                available_times = [
-                    f"{hour:02d}:00" for hour in hours if f"{hour:02d}:00" not in busy
-                ]
+                available_times: List[str] = []
+                for hour in hours:
+                    time_label = f"{hour:02d}:00"
+                    if time_label in busy:
+                        continue
+                    if current == today:
+                        slot_dt = self._slot_datetime(current, time_label)
+                        if slot_dt <= now:
+                            continue
+                    available_times.append(time_label)
                 if available_times:
                     result.append(
                         {
@@ -380,14 +501,12 @@ class BookingAPI:
     def _resolve_phone_for_payload(
         self, meeting_type: str, provided_phone: str
     ) -> Optional[str]:
-        phone = provided_phone.strip()
+        normalized = self._normalize_phone_number(provided_phone, self.default_region)
         if meeting_type == "phone":
-            if phone:
-                return phone
-            if self.caller_phone:
-                return self.caller_phone
-            return None
-        return phone or None
+            if normalized:
+                return normalized
+            return self.caller_phone
+        return normalized
 
     def _build_notification_message(
         self, booking_payload: Dict[str, Any], response_data: Mapping[str, Any]
@@ -566,6 +685,10 @@ class BookingAPI:
             )
             if not valid:
                 errors.append(f"slot: {slot_error}" if slot_error else "slot: Ungültig.")
+            elif slot_date and slot_time and self._is_slot_in_past(slot_date, slot_time):
+                errors.append(
+                    "slot: Der gewünschte Termin liegt in der Vergangenheit."
+                )
 
         if errors:
             await params.result_callback(
@@ -710,22 +833,28 @@ async def run_bot(
     llm.register_function("create_booking", booking_client.handle_create_booking)
 
     logger.info(
-        "Booking API configured at {} (secret configured: {}, caller: {}, twilio: {})",
+        (
+            "Booking API configured at {} (secret configured: {}, caller_raw: {}, "
+            "caller_normalized: {}, twilio_raw: {}, twilio_normalized: {})"
+        ),
         booking_client.base_url,
         bool(agent_secret),
         caller_phone,
+        booking_client.caller_phone,
         twilio_number,
+        booking_client.twilio_from_number,
     )
 
     initial_messages = [
         {"role": "user", "content": INITIAL_GREETING_INSTRUCTION}
     ]
-    if caller_phone:
+    prompt_phone = booking_client.caller_phone or caller_phone
+    if prompt_phone:
         initial_messages.append(
             {
                 "role": "user",
                 "content": CALLER_PHONE_INSTRUCTION_TEMPLATE.format(
-                    phone=caller_phone
+                    phone=prompt_phone
                 ),
             }
         )
