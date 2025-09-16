@@ -31,24 +31,29 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 load_dotenv(override=True)
 
 
-DEFAULT_SYSTEM_PROMPT = (
-    "Du bist der deutschsprachige Voice-Agent unserer Agentur."
-    " Du hilfst aktiv bei Terminbuchungen und nutzt dafür die bereitgestellten"
-    " Tools. Prüfe Verfügbarkeiten mit `get_bookings` und lege Termine mit"
-    " `create_booking` an. Arbeite ausschließlich mit Zeiten zur vollen Stunde"
-    " (Format HH:MM) und in der Zeitzone Europe/Berlin. Halte dich an die"
-    " Öffnungszeiten: Montag–Freitag Startzeiten 07:00–14:00, Samstag"
-    " 07:00–12:00, Sonntag geschlossen. Erfrage Name, E-Mail-Adresse und die"
-    " gewünschte Kontaktart (phone/zoom/teams). Die Telefonnummer des Anrufers"
-    " liegt dir aus dem System bereits vor – frage nicht erneut danach."
-    " Bestätige Details, prüfe Slots und mache Alternativvorschläge, falls"
-    " gewünschte Termine nicht verfügbar sind."
-)
+DEFAULT_SYSTEM_PROMPT = """
+Du bist der deutschsprachige Voice-Agent unserer Agentur. Du hilfst aktiv bei Terminbuchungen
+und nutzt dafür die bereitgestellten Tools. Prüfe Verfügbarkeiten mit `get_bookings` und lege
+Termine mit `create_booking` an. Arbeite ausschließlich mit Zeiten zur vollen Stunde (Format
+HH:MM) und in der Zeitzone Europe/Berlin. Halte dich an die Öffnungszeiten: Montag–Freitag
+Startzeiten 07:00–14:00, Samstag 07:00–12:00, Sonntag geschlossen. Erfrage Name,
+E-Mail-Adresse und die gewünschte Kontaktart (phone/zoom/teams). Die Telefonnummer des
+Anrufers liegt dir aus dem System bereits vor – frage nicht erneut danach. Bestätige Details,
+prüfe Slots und mache Alternativvorschläge, falls gewünschte Termine nicht verfügbar sind.
+""".strip()
 
 DEFAULT_BOOKING_BASE_URL = "https://agentur.fly.dev"
 DEFAULT_NOTIFICATION_RECIPIENT = "+4915752651227"
 BOOKING_TIMEZONE = "Europe/Berlin"
 ALLOWED_MEETING_TYPES = {"phone", "zoom", "teams"}
+INITIAL_GREETING_INSTRUCTION = (
+    "Begrüße den Anrufer freundlich, erkläre kurz, dass du bei "
+    "Terminbuchungen helfen kannst, und frage nach dem Anliegen."
+)
+CALLER_PHONE_INSTRUCTION_TEMPLATE = (
+    "Der aktuelle Anrufer wurde über Twilio identifiziert. Verwende für "
+    "Telefontermine automatisch die Nummer {phone} und frage nicht erneut danach."
+)
 MEETING_TYPE_ALIASES = {
     "telefon": "phone",
     "telefonat": "phone",
@@ -713,22 +718,14 @@ async def run_bot(
     )
 
     initial_messages = [
-        {
-            "role": "user",
-            "content": (
-                "Begrüße den Anrufer freundlich, erkläre kurz, dass du bei"
-                " Terminbuchungen helfen kannst, und frage nach dem Anliegen."
-            ),
-        }
+        {"role": "user", "content": INITIAL_GREETING_INSTRUCTION}
     ]
     if caller_phone:
         initial_messages.append(
             {
                 "role": "user",
-                "content": (
-                    "Der aktuelle Anrufer wurde über Twilio identifiziert."
-                    f" Verwende für Telefontermine automatisch die Nummer"
-                    f" {caller_phone} und frage nicht erneut danach."
+                "content": CALLER_PHONE_INSTRUCTION_TEMPLATE.format(
+                    phone=caller_phone
                 ),
             }
         )
