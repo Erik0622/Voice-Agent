@@ -20,6 +20,7 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import parse_telephony_websocket
+from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.gemini_multimodal_live import GeminiMultimodalLiveLLMService
 from pipecat.services.gemini_multimodal_live.gemini import (
@@ -56,10 +57,26 @@ INITIAL_GREETING_INSTRUCTION = (
     "Begrüße den Anrufer freundlich, erkläre kurz, dass du bei "
     "Terminbuchungen helfen kannst, und frage nach dem Anliegen."
 )
+DEFAULT_PROVIDER_LABEL = "das Telefonsystem"
 CALLER_PHONE_INSTRUCTION_TEMPLATE = (
-    "Der aktuelle Anrufer wurde über Twilio identifiziert. Verwende für "
+    "Der aktuelle Anrufer wurde über {provider} identifiziert. Verwende für "
     "Telefontermine automatisch die Nummer {phone} und frage nicht erneut danach."
 )
+TELNYX_ENCODING_ALIASES = {
+    "ULAW": "PCMU",
+    "MULAW": "PCMU",
+    "AUDIO/X-MULAW": "PCMU",
+    "AUDIO/PCMU": "PCMU",
+    "AUDIO/X-ALAW": "PCMA",
+    "AUDIO/PCMA": "PCMA",
+}
+
+
+def _normalize_telnyx_encoding(value: Optional[str], default: str = "PCMU") -> str:
+    if not value:
+        return default
+    normalized = value.strip().upper()
+    return TELNYX_ENCODING_ALIASES.get(normalized, normalized or default)
 MEETING_TYPE_ALIASES = {
     "telefon": "phone",
     "telefonat": "phone",
@@ -166,14 +183,16 @@ class BookingAPI:
         timezone: str = BOOKING_TIMEZONE,
         *,
         caller_phone: Optional[str] = None,
-        twilio_from_number: Optional[str] = None,
+        telephony_from_number: Optional[str] = None,
         notification_recipient: Optional[str] = None,
+        provider_label: str = DEFAULT_PROVIDER_LABEL,
     ) -> None:
         self.base_url = base_url.rstrip("/") or DEFAULT_BOOKING_BASE_URL
         self.agent_secret = agent_secret
         self.timezone = timezone
         self._timeout = httpx.Timeout(10.0)
         self._tzinfo = ZoneInfo(self.timezone)
+        self.provider_label = (provider_label or DEFAULT_PROVIDER_LABEL).strip() or DEFAULT_PROVIDER_LABEL
 
         default_region_env = os.getenv("BOOKING_DEFAULT_REGION", "").strip().upper()
         self.default_region = default_region_env or "DE"
@@ -187,14 +206,17 @@ class BookingAPI:
         if caller_region:
             self.default_region = caller_region
 
-        from_number = twilio_from_number.strip() if twilio_from_number else None
+        from_number = telephony_from_number.strip() if telephony_from_number else None
         if not from_number:
-            fallback_from = os.getenv("TWILIO_SMS_FROM_NUMBER")
+            fallback_from = (
+                os.getenv("BOOKING_NOTIFICATION_SMS_FROM")
+                or os.getenv("TWILIO_SMS_FROM_NUMBER")
+            )
             from_number = fallback_from.strip() if fallback_from else None
-        self.twilio_from_number = self._normalize_phone_number(from_number, None)
-        if from_number and not self.twilio_from_number:
+        self.sms_from_number = self._normalize_phone_number(from_number, None)
+        if from_number and not self.sms_from_number:
             logger.warning(
-                "Twilio-Absendernummer konnte nicht normalisiert werden: {}",
+                "SMS-Absendernummer konnte nicht normalisiert werden: {}",
                 from_number,
             )
 
@@ -538,7 +560,7 @@ class BookingAPI:
                 "SMS-Benachrichtigung übersprungen: Twilio-Zugangsdaten fehlen."
             )
             return
-        if not self.twilio_from_number:
+        if not self.sms_from_number:
             logger.warning(
                 "SMS-Benachrichtigung übersprungen: Absendernummer unbekannt."
             )
@@ -550,7 +572,7 @@ class BookingAPI:
         )
         data = {
             "To": self.notification_recipient,
-            "From": self.twilio_from_number,
+            "From": self.sms_from_number,
             "Body": body,
         }
 
@@ -574,7 +596,7 @@ class BookingAPI:
         else:
             logger.info(
                 "SMS-Benachrichtigung für Buchung gesendet: {} -> {}",
-                self.twilio_from_number,
+                self.sms_from_number,
                 self.notification_recipient,
             )
 
@@ -802,14 +824,15 @@ async def run_bot(
     transport: BaseTransport,
     handle_sigint: bool,
     caller_phone: Optional[str] = None,
-    twilio_number: Optional[str] = None,
+    provider_number: Optional[str] = None,
+    provider_label: str = DEFAULT_PROVIDER_LABEL,
 ):
     system_prompt = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
     tools_schema = build_booking_tools_schema()
 
     llm = GeminiMultimodalLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
-        model="models/gemini-2.5-flash-preview-native-audio-dialog",
+        model="models/gemini-live-2.5-flash-preview",
         system_instruction=system_prompt,
         tools=tools_schema,
         params=InputParams(
@@ -828,8 +851,9 @@ async def run_bot(
         base_url=booking_base_url,
         agent_secret=agent_secret,
         caller_phone=caller_phone,
-        twilio_from_number=twilio_number,
+        telephony_from_number=provider_number,
         notification_recipient=sms_recipient or None,
+        provider_label=provider_label,
     )
 
     llm.register_function("get_bookings", booking_client.handle_get_bookings)
@@ -838,14 +862,15 @@ async def run_bot(
     logger.info(
         (
             "Booking API configured at {} (secret configured: {}, caller_raw: {}, "
-            "caller_normalized: {}, twilio_raw: {}, twilio_normalized: {})"
+            "caller_normalized: {}, telephony_raw: {}, sms_sender: {}, provider: {})"
         ),
         booking_client.base_url,
         bool(agent_secret),
         caller_phone,
         booking_client.caller_phone,
-        twilio_number,
-        booking_client.twilio_from_number,
+        provider_number,
+        booking_client.sms_from_number,
+        booking_client.provider_label,
     )
 
     initial_messages = [
@@ -857,7 +882,8 @@ async def run_bot(
             {
                 "role": "user",
                 "content": CALLER_PHONE_INSTRUCTION_TEMPLATE.format(
-                    phone=prompt_phone
+                    phone=prompt_phone,
+                    provider=booking_client.provider_label,
                 ),
             }
         )
@@ -913,27 +939,75 @@ async def bot(runner_args: RunnerArguments, testing: bool | None = False):
         # Wenn Parsing wiederholt scheitert, breche sauber ab
         return
     caller_phone: Optional[str] = None
-    twilio_number: Optional[str] = None
-    if isinstance(call_data, Mapping):
-        body = call_data.get("body")
-        if isinstance(body, Mapping):
-            caller_raw = str(body.get("from") or "").strip()
-            twilio_raw = str(body.get("to") or "").strip()
+    provider_number: Optional[str] = None
+    provider_label = DEFAULT_PROVIDER_LABEL
+
+    if transport_type == "twilio":
+        provider_label = "Twilio"
+        stream_sid: Optional[str] = None
+        call_sid: Optional[str] = None
+        if isinstance(call_data, Mapping):
+            body = call_data.get("body")
+            if isinstance(body, Mapping):
+                caller_raw = str(body.get("from") or "").strip()
+                callee_raw = str(body.get("to") or "").strip()
+                caller_phone = caller_raw or None
+                provider_number = callee_raw or None
+            stream_sid = call_data.get("stream_id")
+            call_sid = call_data.get("call_id")
+        if not stream_sid or not call_sid:
+            logger.error("Twilio-Startpayload unvollständig: {}", call_data)
+            return
+        serializer = TwilioFrameSerializer(
+            stream_sid=stream_sid,
+            call_sid=call_sid,
+            account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
+            auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+        )
+    elif transport_type == "telnyx":
+        provider_label = "Telnyx"
+        stream_id: Optional[str] = None
+        call_control_id: Optional[str] = None
+        outbound_encoding_raw: Optional[str] = None
+        if isinstance(call_data, Mapping):
+            caller_raw = str(call_data.get("from") or "").strip()
+            callee_raw = str(call_data.get("to") or "").strip()
             caller_phone = caller_raw or None
-            twilio_number = twilio_raw or None
+            provider_number = callee_raw or None
+            stream_id = call_data.get("stream_id")
+            call_control_id = call_data.get("call_control_id")
+            outbound_encoding_raw = call_data.get("outbound_encoding")
+        if not stream_id:
+            logger.error("Telnyx-Startpayload ohne stream_id: {}", call_data)
+            return
+        inbound_encoding = _normalize_telnyx_encoding(
+            os.getenv("TELNYX_INBOUND_ENCODING"), "PCMU"
+        )
+        outbound_encoding = _normalize_telnyx_encoding(
+            os.getenv("TELNYX_OUTBOUND_ENCODING"),
+            _normalize_telnyx_encoding(outbound_encoding_raw, "PCMU"),
+        )
+        telnyx_api_key = os.getenv("TELNYX_API_KEY", "").strip()
+        auto_hang_up = bool(telnyx_api_key and call_control_id)
+        telnyx_params = TelnyxFrameSerializer.InputParams(auto_hang_up=auto_hang_up)
+        serializer = TelnyxFrameSerializer(
+            stream_id=stream_id,
+            outbound_encoding=outbound_encoding,
+            inbound_encoding=inbound_encoding,
+            call_control_id=call_control_id,
+            api_key=telnyx_api_key if auto_hang_up else None,
+            params=telnyx_params,
+        )
+    else:
+        logger.error("Unbekannter Telephony-Transport: {}", transport_type)
+        return
 
     logger.info(
-        "Detected transport: {} (caller: {}, twilio: {})",
+        "Detected transport: {} (caller: {}, number: {}, provider: {})",
         transport_type,
         caller_phone,
-        twilio_number,
-    )
-
-    serializer = TwilioFrameSerializer(
-        stream_sid=call_data["stream_id"],
-        call_sid=call_data["call_id"],
-        account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
-        auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+        provider_number,
+        provider_label,
     )
 
     transport = FastAPIWebsocketTransport(
@@ -951,7 +1025,8 @@ async def bot(runner_args: RunnerArguments, testing: bool | None = False):
         transport,
         runner_args.handle_sigint,
         caller_phone=caller_phone,
-        twilio_number=twilio_number,
+        provider_number=provider_number,
+        provider_label=provider_label,
     )
 
 
