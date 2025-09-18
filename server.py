@@ -4,6 +4,10 @@ import os
 import time
 from typing import Any, Dict, Optional
 
+from urllib.parse import quote
+=======
+
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +19,16 @@ load_dotenv(override=True)
 
 app = FastAPI()
 app.state.start_ts = time.time()
+app.state.telnyx_stream_started: set[str] = set()
+
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
+TELEPHONY_WS_URL = os.getenv("TELEPHONY_WS_URL", "").strip()
+TELNYX_API_KEY = os.getenv("TELNYX_API_KEY", "").strip()
+TELNYX_API_BASE_URL = os.getenv("TELNYX_API_BASE_URL", "https://api.telnyx.com/v2").rstrip("/")
+TELNYX_STREAM_TRACK = (os.getenv("TELNYX_STREAM_TRACK", "both") or "both").strip() or "both"
+TELNYX_STREAM_TYPE = (os.getenv("TELNYX_STREAM_TYPE", "audio") or "audio").strip() or "audio"
+TELNYX_AUTO_ANSWER = os.getenv("TELNYX_AUTO_ANSWER", "true").lower() not in {"false", "0", "no"}
+TELNYX_TIMEOUT = httpx.Timeout(10.0)
 
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 TELEPHONY_WS_URL = os.getenv("TELEPHONY_WS_URL", "").strip()
@@ -127,7 +141,12 @@ async def _telnyx_call_control_action(
         )
         return False
 
+
+    encoded_call_control_id = quote(str(call_control_id), safe="")
+    url = f"{TELNYX_API_BASE_URL}/calls/{encoded_call_control_id}/actions/{action}"
+=======
     url = f"{TELNYX_API_BASE_URL}/calls/{call_control_id}/actions/{action}"
+
     headers = {
         "Authorization": f"Bearer {TELNYX_API_KEY}",
         "Content-Type": "application/json",
@@ -158,6 +177,14 @@ async def _telnyx_start_stream(payload: Dict[str, Any], host: Optional[str]) -> 
         logger.warning("Telnyx-Event ohne call_control_id: {}", payload)
         return
 
+
+    started_set = getattr(app.state, "telnyx_stream_started", set())
+    if call_control_id in started_set:
+        logger.debug("Telnyx-Stream für {} wurde bereits angefordert", call_control_id)
+        return
+
+=======
+
     try:
         ws_url = _get_ws_url(host)
     except HTTPException as exc:
@@ -169,21 +196,33 @@ async def _telnyx_start_stream(payload: Dict[str, Any], host: Optional[str]) -> 
 
     logger.info("Starte Telnyx-Stream {} -> {}", call_control_id, ws_url)
 
+
+=======
     if TELNYX_AUTO_ANSWER:
         answered = await _telnyx_call_control_action(call_control_id, "answer")
         if not answered:
             return
+
 
     stream_payload: Dict[str, Any] = {
         "stream_url": ws_url,
         "stream_track": TELNYX_STREAM_TRACK,
         "stream_type": TELNYX_STREAM_TYPE,
     }
+
+    started = await _telnyx_call_control_action(
+=======
     await _telnyx_call_control_action(
+
         call_control_id,
         "stream_start",
         stream_payload,
     )
+
+    if started:
+        started_set.add(call_control_id)
+=======
+
 
 @app.get("/health")
 async def health():
@@ -237,9 +276,26 @@ async def _handle_telnyx_webhook(request: Request) -> JSONResponse:
     host = _extract_request_host(request)
 
     if event_type == "call.initiated":
+
+        if TELNYX_AUTO_ANSWER:
+            if call_control_id:
+                asyncio.create_task(
+                    _telnyx_call_control_action(call_control_id, "answer")
+                )
+            else:
+                logger.warning(
+                    "Telnyx call.initiated ohne call_control_id: {}", payload
+                )
+    elif event_type == "call.answered":
         asyncio.create_task(_telnyx_start_stream(event_payload, host))
     elif event_type == "call.hangup":
         logger.info("Telnyx-Hangup erhalten für {}", call_control_id)
+        getattr(app.state, "telnyx_stream_started", set()).discard(call_control_id)
+=======
+        asyncio.create_task(_telnyx_start_stream(event_payload, host))
+    elif event_type == "call.hangup":
+        logger.info("Telnyx-Hangup erhalten für {}", call_control_id)
+
     elif event_type:
         logger.debug("Telnyx-Event {} empfangen", event_type)
     else:
